@@ -16,7 +16,7 @@ local fakeDeathActive = false
 local FAST_WALK_SPEED = 160
 local carrySpeedMultiplier = 1
 local carryState = nil
-local stealSpeed = 500
+local stealSpeed = 350
 local stealCount = 0
 local SAFE_CLAIM_POS = Vector3.new(544.577637, 92.0762939, -364.869049)
 local TAKEOFF_TIME = 0.8
@@ -27,7 +27,7 @@ local rareMinTier = 8
 local speedBoostEnabled = false
 local speedSessionId = nil
 
-local returnMethod = "Instant TP"
+local returnMethod = "Tween to Base"
 local ragdollTimeout = 7
 local baitSlotTargetName = "FirstAreaEgg_11569730011_5962409_Forest:Slot_001"
 
@@ -968,6 +968,72 @@ local function WaitForChickenRagdoll(timeout)
     return triggered
 end
 
+local function TweenToBase(targetPos, speed)
+    local chr = LocalPlayer.Character
+    if not chr then return false end
+    local hrp = chr:FindFirstChild("HumanoidRootPart")
+    local hum = chr:FindFirstChildOfClass("Humanoid")
+    if not hrp then return false end
+
+    pcall(function()
+        if hum then
+            hum.Sit = false
+            hum.PlatformStand = false
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end)
+
+    local targetCFrame = CFrame.new(targetPos.X, targetPos.Y + 3, targetPos.Z)
+    local distance = (targetPos - hrp.Position).Magnitude
+    local tSpeed = math.max(50, tonumber(speed or stealSpeed) or 350)
+    local duration = math.max(0.05, distance / tSpeed)
+
+    local bv = hrp:FindFirstChild("StealTweenBV") or Instance.new("BodyVelocity")
+    bv.Name = "StealTweenBV"
+    bv.Velocity = Vector3.zero
+    bv.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    bv.Parent = hrp
+
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+    local tween = TweenService:Create(hrp, tweenInfo, { CFrame = targetCFrame })
+
+    local completed = false
+    local conn = tween.Completed:Connect(function()
+        completed = true
+    end)
+
+    tween:Play()
+
+    local startT = os.clock()
+    while not completed and not HUB.dead and (os.clock() - startT < duration + 2) do
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        task.wait(0.05)
+    end
+
+    pcall(function() conn:Disconnect() end)
+    pcall(function() bv:Destroy() end)
+
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    hrp.CFrame = targetCFrame
+
+    pcall(function()
+        if hum then
+            hum.Sit = false
+            hum.PlatformStand = false
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            task.defer(function()
+                if hum and hum.Parent then
+                    hum:ChangeState(Enum.HumanoidStateType.Running)
+                end
+            end)
+        end
+    end)
+
+    return true
+end
+
 local function StealOnce()
     local chr = LocalPlayer.Character
     if not chr or not chr.Parent then return false, "no character" end
@@ -991,7 +1057,7 @@ local function StealOnce()
         local baitPos = GetSlotPosition(baitFolder)
         if not baitPos then error("EXIT:bait egg position not found") end
 
-        -- 1. Teleport to bait egg
+        -- 1. TP to bait egg
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
         hrp.CFrame = CFrame.new(baitPos + Vector3.new(0, 2.5, 0))
@@ -999,23 +1065,33 @@ local function StealOnce()
         hrp.AssemblyAngularVelocity = Vector3.zero
         task.wait(0.1)
 
-        -- 2. Fire pickup remote on bait slot
-        fireEggPickup(baitFolder, baitPos)
+        -- 2. Pick it up (make sure we actually grab/hold it!)
         if Library and Library.Notify then
-            Library:Notify("Auto Steal: Bait triggered (" .. tostring(baitFolder.Name) .. "), waiting for chicken...")
+            Library:Notify("Auto Steal: Picking up bait egg (" .. tostring(baitFolder.Name) .. ")...")
+        end
+        fireEggPickup(baitFolder, baitPos)
+
+        local baitT0 = os.clock()
+        while not HUB.dead and (os.clock() - baitT0 < 1.5) do
+            if IsCarryingEgg() then break end
+            fireEggPickup(baitFolder, baitPos)
+            task.wait(0.08)
         end
 
         -- 3. Wait for chicken to ragdoll the character
+        if Library and Library.Notify then
+            Library:Notify("Auto Steal: Holding bait — waiting for chicken to ragdoll...")
+        end
         local wasRagdolled = WaitForChickenRagdoll(ragdollTimeout)
 
-        -- 4. AT THE INSTANT OF RAGDOLL: Snap to target egg & pick up!
+        -- 4. AT THE SAME TIME: Instant TP to another egg & pick it up!
         local targetEgg = FindTargetEgg(baitFolder)
         if not targetEgg or not targetEgg.Position then
             error("EXIT:no target egg found")
         end
 
         if Library and Library.Notify then
-            Library:Notify("Auto Steal: Chicken ragdolled! Snapping to " .. tostring(targetEgg.Category or "egg") .. "...")
+            Library:Notify("Auto Steal: Chicken hit! Snapping to " .. tostring(targetEgg.Category or "egg") .. "...")
         end
 
         hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1037,22 +1113,20 @@ local function StealOnce()
             task.wait(0.08)
         end
 
-        -- 5. Return it to base!
+        -- 5. Tween back to base!
         local base = GetBasePos()
         if Library and Library.Notify then
-            Library:Notify("Auto Steal: Carrying egg! Returning to base...")
+            Library:Notify("Auto Steal: Carrying egg! Tweening back to base...")
         end
 
-        if returnMethod == "Fast Walk" then
-            local gyHome = GroundY(base.X, base.Z, base.Y)
-            local okHome = FastWalk(Vector3.new(base.X, gyHome, base.Z), 30, 2)
-            if not okHome then error("EXIT:walk home failed") end
-        else
+        if returnMethod == "Instant TP" then
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.AssemblyAngularVelocity = Vector3.zero
             hrp.CFrame = CFrame.new(base.X, base.Y + 3, base.Z)
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.AssemblyAngularVelocity = Vector3.zero
+        else
+            TweenToBase(base, stealSpeed)
         end
 
         -- Stand up / clear ragdoll at base
@@ -1739,7 +1813,7 @@ AutoStealGroup:AddToggle("EnableAutoSteal", { Text = "Enable Auto Steal", Defaul
 end })
 
 AutoStealGroup:AddDropdown("ReturnMethodDropdown", {
-    Values = { "Instant TP", "Fast Walk" },
+    Values = { "Tween to Base", "Instant TP" },
     Default = 1,
     Text = "Return Method",
     Callback = function(v)
@@ -1778,8 +1852,8 @@ AutoStealGroup:AddToggle("SpeedBoost", { Text = "Speed Boost", Default = false, 
     end
 end })
 
-AutoStealGroup:AddSlider("GlideSpeed", { Text = "Glide Speed", Default = 500, Min = 50, Max = 500, Rounding = 0, Suffix = " studs/s", Callback = function(v)
-    stealSpeed = math.clamp(v, 50, 500)
+AutoStealGroup:AddSlider("GlideSpeed", { Text = "Tween Speed", Default = 350, Min = 50, Max = 600, Rounding = 0, Suffix = " studs/s", Callback = function(v)
+    stealSpeed = math.clamp(v, 50, 600)
 end })
 
 AutoStealGroup:AddDropdown("EggRarityFilter", {
